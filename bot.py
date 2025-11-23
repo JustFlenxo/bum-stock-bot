@@ -4,6 +4,7 @@ import discord
 from discord.ext import tasks
 from datetime import datetime, timezone
 
+# ================= CONFIG =================
 SEARCH_URLS = [
     "https://www.ekopyro.eu/page-search-eu/all/?s_keyword=fp3",
     "https://www.ekopyro.eu/page-search-eu/all/?s_keyword=p1",
@@ -31,6 +32,13 @@ STATE_FILE = "state.json"
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
 
+# What to ping on alerts:
+# examples:
+#   "@here"
+#   "@everyone"
+#   "<@&ROLE_ID>"   (role mention)
+PING_TEXT = os.getenv("PING_TEXT", "@here")
+
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN not set")
 if CHANNEL_ID == 0:
@@ -45,7 +53,7 @@ BAD_WORDS = [
     "roman candle", "candle", "fountain", "mine",
     "launcher", "tube", "volcano", "spark", "flare", "signal",
     "assortment", "set", "fan", "compound", "shell", "mortar",
-    "smoke", "strobe", "torch", "flare gun", "confetti"
+    "smoke", "strobe", "torch", "confetti"
 ]
 
 GOOD_WORDS = [
@@ -62,6 +70,7 @@ KNOWN_BRANDS = [
     "Piromax", "Iskra", "Nico", "Black Cat", "Lesli", "Riakeo"
 ]
 
+# ================= SCRAPER HELPERS =================
 def fetch_html(url: str) -> str:
     r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
@@ -148,6 +157,7 @@ def scrape_all_firecrackers():
         time.sleep(0.25)
     return merged
 
+# ================= STATE =================
 def load_state():
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -159,6 +169,7 @@ def save_state(s):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(s, f, ensure_ascii=False, indent=2)
 
+# ================= DISCORD BOT =================
 intents = discord.Intents.default()
 client = discord.Client(intents=intents)
 
@@ -236,6 +247,65 @@ async def get_or_create_family_message(channel, state, key, title):
     save_state(state)
     return m
 
+def detect_changes(prev_products: dict, current: dict):
+    """
+    prev_products: title -> stock text
+    current: title -> {stock, link, family, price, brand}
+    returns list of (kind, title, prev_stock, new_stock, link)
+    """
+    changes = []
+    for title, info in current.items():
+        new_stock = info["stock"]
+        prev_stock = prev_products.get(title)
+
+        if prev_stock is None:
+            # new item discovered - treat as info, not ping
+            prev_products[title] = new_stock
+            continue
+
+        if prev_stock != new_stock:
+            prev_sold = is_sold_out(prev_stock)
+            new_sold = is_sold_out(new_stock)
+
+            if prev_sold and not new_sold:
+                kind = "RESTOCKED"
+            elif not prev_sold and new_sold:
+                kind = "SOLD OUT"
+            else:
+                kind = "CHANGED"
+
+            changes.append((kind, title, prev_stock, new_stock, info["link"]))
+            prev_products[title] = new_stock
+
+    return changes
+
+async def send_change_alerts(channel, changes):
+    if not changes:
+        return
+
+    restocked = [c for c in changes if c[0] == "RESTOCKED"]
+    soldout   = [c for c in changes if c[0] == "SOLD OUT"]
+    other     = [c for c in changes if c[0] == "CHANGED"]
+
+    lines = []
+    if restocked:
+        lines.append("✅ **RESTOCKED:**")
+        for _, title, before, now, link in restocked:
+            lines.append(f"- **[{title}]({link})** → `{now}`")
+    if soldout:
+        lines.append("")
+        lines.append("❌ **SOLD OUT:**")
+        for _, title, before, now, link in soldout:
+            lines.append(f"- **{title}** → `{now}`")
+    if other:
+        lines.append("")
+        lines.append("ℹ️ **STATUS CHANGED:**")
+        for _, title, before, now, link in other:
+            lines.append(f"- **{title}**: `{before}` → `{now}`")
+
+    msg = f"{PING_TEXT}\n" + "\n".join(lines)
+    await channel.send(msg)
+
 @tasks.loop(minutes=10)
 async def check_stock():
     try:
@@ -247,6 +317,16 @@ async def check_stock():
             print("No firecrackers found this run.")
             return
 
+        # --- CHANGE DETECTION ---
+        prev_products = state.get("product_stocks", {})
+        changes = detect_changes(prev_products, current)
+        state["product_stocks"] = prev_products
+        save_state(state)
+
+        # Alert if changes happened
+        await send_change_alerts(channel, changes)
+
+        # --- LIVE FAMILY MESSAGES ---
         families = {name: [] for name in list(FAMILY_RULES.keys()) + ["Other"]}
         for name, info in current.items():
             fam = info.get("family", "Other")
